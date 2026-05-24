@@ -85,7 +85,7 @@ SentinelAI is a production-grade, autonomous security scanning agent that audits
 
 1. **Clone the repository:**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/MARSWALLET/sentinel-ai.git
    cd sentinel-ai
    ```
 
