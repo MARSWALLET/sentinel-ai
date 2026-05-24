@@ -1,0 +1,244 @@
+# ============================================
+# SentinelAI - GitLab CI Template
+# ============================================
+# Add this to your repository as .gitlab-ci.yml
+# This pipeline triggers SentinelAI security scans on merge requests and scheduled runs.
+#
+# Required CI/CD variables (set in GitLab project settings):
+#   SENTINELAI_API_KEY - Your SentinelAI organization API key
+#   SENTINELAI_BASE_URL - Your SentinelAI instance URL
+#
+# Optional variables:
+#   SENTINELAI_FAIL_ON - Minimum severity to fail pipeline (default: high)
+#   SENTINELAI_MODULES - Comma-separated list of modules (default: sast,secrets,dependencies,ai_review)
+
+variables:
+  SENTINELAI_BASE_URL: "$SENTINELAI_BASE_URL"
+  SENTINELAI_FAIL_ON: "$SENTINELAI_FAIL_ON"
+  SENTINELAI_MODULES: "$SENTINELAI_MODULES"
+  FAIL_ON: "${SENTINELAI_FAIL_ON:-high}"
+  MODULES: "${SENTINELAI_MODULES:-sast,secrets,dependencies,ai_review}"
+  SCAN_DEPTH: "standard"
+
+stages:
+  - security-scan
+  - report
+
+# Cache downloaded tools between jobs
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - .cache/
+
+# --- Security Scan Job ---
+sentinelai-scan:
+  stage: security-scan
+  image: curlimages/curl:latest
+  timeout: 30 minutes
+  variables:
+    GIT_DEPTH: 0  # Full clone for secrets scanning
+  
+  before_script:
+    - apk add --no-cache jq python3
+  
+  script:
+    - echo "Starting SentinelAI security scan..."
+    - echo "Repository: $CI_REPOSITORY_URL"
+    - echo "Branch: $CI_COMMIT_REF_NAME"
+    - echo "Commit: $CI_COMMIT_SHA"
+    - echo "Modules: $MODULES"
+    - echo "Depth: $SCAN_DEPTH"
+    
+    # Start scan via SentinelAI API
+    - >
+      START_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST
+      "${SENTINELAI_BASE_URL}/api/scans/github"
+      -H "Authorization: Bearer ${SENTINELAI_API_KEY}"
+      -H "Content-Type: application/json"
+      -d "{
+        \"repo_url\": \"${CI_PROJECT_URL}\",
+        \"branch\": \"${CI_COMMIT_REF_NAME}\",
+        \"modules\": [$(echo "$MODULES" | tr ',' '\n' | sed 's/^/"/;s/$/"/' | paste -sd, -)],
+        \"github_token\": \"${CI_JOB_TOKEN}\"
+      }")
+    
+    - HTTP_CODE=$(echo "$START_RESPONSE" | tail -n1)
+    - BODY=$(echo "$START_RESPONSE" | sed '$d')
+    - echo "Response: HTTP $HTTP_CODE - $BODY"
+    
+    - |
+      if [ "$HTTP_CODE" != "202" ]; then
+        echo "ERROR: Failed to start scan (HTTP $HTTP_CODE)"
+        echo "$BODY"
+        exit 1
+      fi
+    
+    # Extract scan ID
+    - SCAN_ID=$(echo "$BODY" | jq -r '.scan_id')
+    - echo "Scan ID: $SCAN_ID"
+    - echo "SCAN_ID=$SCAN_ID" >> scan.env
+    
+    # Poll for completion
+    - >
+      MAX_WAIT=1800
+      WAITED=0
+      while [ $WAITED -lt $MAX_WAIT ]; do
+        sleep 15
+        WAITED=$((WAITED + 15))
+        
+        STATUS_RESPONSE=$(curl -s
+          "${SENTINELAI_BASE_URL}/api/scans/${SCAN_ID}"
+          -H "Authorization: Bearer ${SENTINELAI_API_KEY}")
+        
+        STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status')
+        echo "Status: $STATUS (${WAITED}s elapsed)"
+        
+        if [ "$STATUS" = "complete" ]; then
+          GRADE=$(echo "$STATUS_RESPONSE" | jq -r '.grade')
+          RISK_SCORE=$(echo "$STATUS_RESPONSE" | jq -r '.risk_score')
+          
+          echo "GRADE=$GRADE" >> scan.env
+          echo "RISK_SCORE=$RISK_SCORE" >> scan.env
+          
+          # Get findings count
+          FINDINGS_RESPONSE=$(curl -s
+            "${SENTINELAI_BASE_URL}/api/scans/${SCAN_ID}/findings?severity=${FAIL_ON}"
+            -H "Authorization: Bearer ${SENTINELAI_API_KEY}")
+          
+          FINDINGS_COUNT=$(echo "$FINDINGS_RESPONSE" | jq -r '.total')
+          echo "FINDINGS_COUNT=$FINDINGS_COUNT" >> scan.env
+          
+          echo "Scan complete: Grade=$GRADE, Risk=$RISK_SCORE, Findings=$FINDINGS_COUNT"
+          exit 0
+        fi
+        
+        if [ "$STATUS" = "failed" ]; then
+          echo "ERROR: Scan failed"
+          exit 1
+        fi
+      done
+      
+      echo "ERROR: Scan timed out after ${MAX_WAIT}s"
+      exit 1
+  
+  artifacts:
+    reports:
+      dotenv: scan.env
+    expire_in: 1 week
+  
+  only:
+    - merge_requests
+    - main
+    - master
+    - develop
+    - schedules
+
+# --- Download Reports ---
+sentinelai-reports:
+  stage: report
+  image: curlimages/curl:latest
+  dependencies:
+    - sentinelai-scan
+  
+  script:
+    - mkdir -p reports
+    
+    # Download JSON report
+    - >
+      curl -s "${SENTINELAI_BASE_URL}/api/scans/${SCAN_ID}/report/json"
+      -H "Authorization: Bearer ${SENTINELAI_API_KEY}"
+      -o reports/sentinelai-report.json
+    
+    # Download HTML report
+    - >
+      curl -s "${SENTINELAI_BASE_URL}/api/scans/${SCAN_ID}/report/html"
+      -H "Authorization: Bearer ${SENTINELAI_API_KEY}"
+      -o reports/sentinelai-report.html
+    
+    - echo "Reports downloaded"
+    - ls -la reports/
+  
+  artifacts:
+    name: "sentinelai-report-$CI_COMMIT_REF_NAME"
+    paths:
+      - reports/
+    expire_in: 30 days
+    when: always
+  
+  only:
+    - merge_requests
+    - main
+    - master
+    - develop
+
+# --- MR Comment (GitLab 14.9+) ---
+sentinelai-mr-comment:
+  stage: report
+  image: curlimages/curl:latest
+  dependencies:
+    - sentinelai-scan
+  
+  script:
+    - apk add --no-cache jq
+    - |
+      # Post comment to MR
+      if [ -n "$CI_MERGE_REQUEST_IID" ]; then
+        GRADE_EMOJI="⚪"
+        case "$GRADE" in
+          A) GRADE_EMOJI="🟢" ;;
+          B) GRADE_EMOJI="🟡" ;;
+          C) GRADE_EMOJI="🟠" ;;
+          D) GRADE_EMOJI="🔴" ;;
+          F) GRADE_EMOJI="🚨" ;;
+        esac
+        
+        COMMENT_BODY="${GRADE_EMOJI} **SentinelAI Security Scan**
+
+| Metric | Value |
+|--------|-------|
+| **Grade** | ${GRADE} |
+| **Risk Score** | ${RISK_SCORE}/100 |
+| **${FAIL_ON}+ Severity Findings** | ${FINDINGS_COUNT} |
+
+Scan ID: \`${SCAN_ID}\`"
+        
+        curl -s -X POST \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes" \
+          -H "PRIVATE-TOKEN: ${SENTINELAI_GITLAB_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d "{\"body\": \"$COMMENT_BODY\"}"
+      fi
+  
+  only:
+    - merge_requests
+
+# --- Fail Check ---
+sentinelai-fail-check:
+  stage: report
+  image: alpine:latest
+  dependencies:
+    - sentinelai-scan
+  
+  script:
+    - |
+      if [ "${FINDINGS_COUNT}" -gt 0 ]; then
+        echo "⚠️ Found ${FINDINGS_COUNT} findings with severity >= ${FAIL_ON}"
+        echo "Grade: ${GRADE}, Risk Score: ${RISK_SCORE}"
+        
+        if [ "${FAIL_ON}" = "critical" ]; then
+          echo "Failing pipeline due to critical findings"
+          exit 1
+        fi
+        
+        echo "Pipeline continues (fail threshold not met)"
+      else
+        echo "✅ No findings at or above ${FAIL_ON} severity"
+      fi
+  
+  only:
+    - merge_requests
+    - main
+    - master
+    - develop
+  
+  allow_failure: true  # Don't block merges if below threshold

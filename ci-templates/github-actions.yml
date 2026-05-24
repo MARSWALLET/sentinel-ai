@@ -1,0 +1,240 @@
+# ============================================
+# SentinelAI - GitHub Actions CI/CD Template
+# ============================================
+# Add this file to your repository as .github/workflows/sentinelai.yml
+# This workflow triggers SentinelAI security scans on push and PR events.
+#
+# Required secrets:
+#   SENTINELAI_API_KEY - Your SentinelAI organization API key
+#   SENTINELAI_BASE_URL - Your SentinelAI instance URL (e.g., https://sentinelai.yourcompany.com)
+#
+# Optional secrets:
+#   SENTINELAI_FAIL_ON - Minimum severity to fail build (critical/high/medium)
+#   SENTINELAI_GITHUB_TOKEN - GitHub token for PR comments (optional, uses GITHUB_TOKEN by default)
+
+name: SentinelAI Security Scan
+
+on:
+  push:
+    branches: [ main, master, develop, 'release/*' ]
+  pull_request:
+    branches: [ main, master, develop ]
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      scan_depth:
+        description: 'Scan depth (quick/standard/deep)'
+        required: false
+        default: 'standard'
+        type: choice
+        options:
+          - quick
+          - standard
+          - deep
+
+env:
+  SENTINELAI_BASE_URL: ${{ secrets.SENTINELAI_BASE_URL || 'http://localhost:8000' }}
+  SENTINELAI_FAIL_ON: ${{ secrets.SENTINELAI_FAIL_ON || 'high' }}
+
+jobs:
+  # --- Determine scan configuration ---
+  configure:
+    runs-on: ubuntu-latest
+    outputs:
+      scan_depth: ${{ steps.config.outputs.scan_depth }}
+      modules: ${{ steps.config.outputs.modules }}
+    steps:
+      - name: Configure scan
+        id: config
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "scan_depth=${{ github.event.inputs.scan_depth }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "scan_depth=deep" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" = "refs/heads/main" ] || [ "${{ github.ref }}" = "refs/heads/master" ]; then
+            echo "scan_depth=standard" >> $GITHUB_OUTPUT
+          else
+            echo "scan_depth=quick" >> $GITHUB_OUTPUT
+          fi
+          
+          # Always run core modules
+          echo "modules=sast,secrets,dependencies,ai_review" >> $GITHUB_OUTPUT
+
+  # --- Run security scan ---
+  security-scan:
+    needs: configure
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for secrets scanning
+
+      - name: Checkout code for scan
+        uses: actions/checkout@v4
+        with:
+          path: scan-target
+          fetch-depth: 0
+
+      - name: Send scan to SentinelAI
+        id: scan
+        run: |
+          # Create scan payload
+          cat > scan_payload.json << 'EOF'
+          {
+            "scan_type": "github",
+            "repo_url": "${{ github.server_url }}/${{ github.repository }}",
+            "branch": "${{ github.ref_name }}",
+            "commit": "${{ github.sha }}",
+            "modules": "${{ needs.configure.outputs.modules }}"",
+            "scan_depth": "${{ needs.configure.outputs.scan_depth }}"
+          }
+          EOF
+          
+          # Start scan via API
+          echo "Starting SentinelAI security scan..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ env.SENTINELAI_BASE_URL }}/api/scans/github" \
+            -H "Authorization: Bearer ${{ secrets.SENTINELAI_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "repo_url": "${{ github.server_url }}/${{ github.repository }}",
+              "branch": "${{ github.ref_name }}",
+              "modules": ["sast", "secrets", "dependencies", "ai_review"]
+            }')
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          if [ "$HTTP_CODE" != "202" ]; then
+            echo "Failed to start scan: HTTP $HTTP_CODE"
+            echo "$BODY"
+            exit 1
+          fi
+          
+          SCAN_ID=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['scan_id'])")
+          echo "scan_id=$SCAN_ID" >> $GITHUB_OUTPUT
+          echo "Scan started: $SCAN_ID"
+
+      - name: Wait for scan completion
+        id: results
+        run: |
+          SCAN_ID="${{ steps.scan.outputs.scan_id }}"
+          MAX_WAIT=1800  # 30 minutes
+          WAITED=0
+          
+          while [ $WAITED -lt $MAX_WAIT ]; do
+            sleep 15
+            WAITED=$((WAITED + 15))
+            
+            RESPONSE=$(curl -s \
+              "${{ env.SENTINELAI_BASE_URL }}/api/scans/$SCAN_ID" \
+              -H "Authorization: Bearer ${{ secrets.SENTINELAI_API_KEY }}")
+            
+            STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+            echo "Scan status: $STATUS (waited ${WAITED}s)"
+            
+            if [ "$STATUS" = "complete" ]; then
+              # Get findings
+              FINDINGS=$(curl -s \
+                "${{ env.SENTINELAI_BASE_URL }}/api/scans/$SCAN_ID/findings?severity=${{ env.SENTINELAI_FAIL_ON }}" \
+                -H "Authorization: Bearer ${{ secrets.SENTINELAI_API_KEY }}")
+              
+              COUNT=$(echo "$FINDINGS" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])")
+              GRADE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['grade'])")
+              RISK_SCORE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['risk_score'])")
+              
+              echo "findings_count=$COUNT" >> $GITHUB_OUTPUT
+              echo "grade=$GRADE" >> $GITHUB_OUTPUT
+              echo "risk_score=$RISK_SCORE" >> $GITHUB_OUTPUT
+              echo "Scan complete: Grade $GRADE, Risk Score $RISK_SCORE, $COUNT findings"
+              exit 0
+            fi
+            
+            if [ "$STATUS" = "failed" ]; then
+              echo "Scan failed!"
+              exit 1
+            fi
+          done
+          
+          echo "Scan timed out after ${MAX_WAIT}s"
+          exit 1
+
+      - name: Download report
+        run: |
+          SCAN_ID="${{ steps.scan.outputs.scan_id }}"
+          
+          # Download JSON report
+          curl -s \
+            "${{ env.SENTINELAI_BASE_URL }}/api/scans/$SCAN_ID/report/json" \
+            -H "Authorization: Bearer ${{ secrets.SENTINELAI_API_KEY }}" \
+            -o sentinelai-report.json
+          
+          # Download HTML report
+          curl -s \
+            "${{ env.SENTINELAI_BASE_URL }}/api/scans/$SCAN_ID/report/html" \
+            -H "Authorization: Bearer ${{ secrets.SENTINELAI_API_KEY }}" \
+            -o sentinelai-report.html
+          
+          echo "Reports downloaded"
+          cat sentinelai-report.json | python3 -m json.tool > /dev/null && echo "JSON report valid"
+
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinelai-security-report
+          path: |
+            sentinelai-report.json
+            sentinelai-report.html
+          retention-days: 30
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const findings = '${{ steps.results.outputs.findings_count }}';
+            const grade = '${{ steps.results.outputs.grade }}';
+            const riskScore = '${{ steps.results.outputs.risk_score }}';
+            const scanId = '${{ steps.scan.outputs.scan_id }}';
+            
+            const gradeEmoji = {
+              'A': '🟢', 'B': '🟡', 'C': '🟠', 'D': '🔴', 'F': '🚨'
+            }[grade] || '⚪';
+            
+            const body = `## ${gradeEmoji} SentinelAI Security Scan Results
+            
+            | Metric | Value |
+            |--------|-------|
+            | **Grade** | ${grade} |
+            | **Risk Score** | ${riskScore}/100 |
+            | **${{ env.SENTINELAI_FAIL_ON }}+ Severity Findings** | ${findings} |
+            
+            Scan ID: \`${scanId}\`
+            
+            Reports are available in the workflow artifacts.`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Fail on severity threshold
+        if: steps.results.outputs.findings_count != '0'
+        run: |
+          echo "Found ${{ steps.results.outputs.findings_count }} findings with severity >= ${{ env.SENTINELAI_FAIL_ON }}"
+          echo "Grade: ${{ steps.results.outputs.grade }}"
+          echo "Risk Score: ${{ steps.results.outputs.risk_score }}"
+          
+          if [ "${{ env.SENTINELAI_FAIL_ON }}" = "critical" ] && [ "${{ steps.results.outputs.findings_count }}" -gt 0 ]; then
+            exit 1
+          fi
+          
+          echo "Warning: ${{ steps.results.outputs.findings_count }} findings found, but below fail threshold"

@@ -1,0 +1,205 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: sentinelai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sentinelai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentinelai_secure_password}
+      POSTGRES_DB: ${POSTGRES_DB:-sentinelai}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/init-scripts:/docker-entrypoint-initdb.d
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - sentinelai-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sentinelai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis - Cache + Message Broker for Celery
+  redis:
+    image: redis:7-alpine
+    container_name: sentinelai-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-sentinelai_redis_pass}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - sentinelai-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # OWASP ZAP - Web Application Scanner
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    container_name: sentinelai-zap
+    restart: unless-stopped
+    command: zap.sh -daemon -host 0.0.0.0 -port 8090 -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true -config api.key=${ZAP_API_KEY:-sentinelai-zap-key}
+    ports:
+      - "${ZAP_PORT:-8090}:8090"
+    networks:
+      - sentinelai-network
+    volumes:
+      - zap_data:/zap/wrk
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # FastAPI Application
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinelai-api
+    restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4 --loop uvloop
+    volumes:
+      - scan_workspace:/tmp/scan_workspace
+      - reports_data:/app/reports
+      - ./backend:/app
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://sentinelai:sentinelai_secure_password@postgres:5432/sentinelai}
+      - REDIS_URL=${REDIS_URL:-redis://:sentinelai_redis_pass@redis:6379/0}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL:-redis://:sentinelai_redis_pass@redis:6379/1}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND:-redis://:sentinelai_redis_pass@redis:6379/2}
+      - SECRET_KEY=${SECRET_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER:-deepseek}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-chat}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - ZAP_API_URL=http://zap:8090
+      - ZAP_API_KEY=${ZAP_API_KEY:-sentinelai-zap-key}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_SCAN_DURATION=${MAX_SCAN_DURATION:-3600}
+      - MODULE_TIMEOUT=${MODULE_TIMEOUT:-600}
+      - SELF_HOSTED_MODE=${SELF_HOSTED_MODE:-false}
+      - ALLOWED_INTERNAL_IPS=${ALLOWED_INTERNAL_IPS}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      zap:
+        condition: service_healthy
+    networks:
+      - sentinelai-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker - Scan Task Processor
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinelai-worker
+    restart: unless-stopped
+    command: celery -A tasks.celery_app worker --loglevel=INFO --concurrency=2 -Q scans,default -n worker@%h
+    volumes:
+      - scan_workspace:/tmp/scan_workspace
+      - reports_data:/app/reports
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://sentinelai:sentinelai_secure_password@postgres:5432/sentinelai}
+      - REDIS_URL=${REDIS_URL:-redis://:sentinelai_redis_pass@redis:6379/0}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL:-redis://:sentinelai_redis_pass@redis:6379/1}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND:-redis://:sentinelai_redis_pass@redis:6379/2}
+      - SECRET_KEY=${SECRET_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER:-deepseek}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-chat}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - ZAP_API_URL=http://zap:8090
+      - ZAP_API_KEY=${ZAP_API_KEY:-sentinelai-zap-key}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_SCAN_DURATION=${MAX_SCAN_DURATION:-3600}
+      - MODULE_TIMEOUT=${MODULE_TIMEOUT:-600}
+      - SELF_HOSTED_MODE=${SELF_HOSTED_MODE:-false}
+      - ALLOWED_INTERNAL_IPS=${ALLOWED_INTERNAL_IPS}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      zap:
+        condition: service_healthy
+    networks:
+      - sentinelai-network
+    privileged: true
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+
+  # Celery Beat - Scheduled Task Scheduler
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinelai-beat
+    restart: unless-stopped
+    command: celery -A tasks.celery_app beat --loglevel=INFO --scheduler redbeat.RedBeatScheduler
+    volumes:
+      - ./backend:/app
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://sentinelai:sentinelai_secure_password@postgres:5432/sentinelai}
+      - REDIS_URL=${REDIS_URL:-redis://:sentinelai_redis_pass@redis:6379/0}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL:-redis://:sentinelai_redis_pass@redis:6379/1}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND:-redis://:sentinelai_redis_pass@redis:6379/2}
+      - SECRET_KEY=${SECRET_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - sentinelai-network
+
+  # Flower - Celery Monitoring UI
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinelai-flower
+    restart: unless-stopped
+    command: celery -A tasks.celery_app flower --port=5555 --basic-auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL:-redis://:sentinelai_redis_pass@redis:6379/1}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND:-redis://:sentinelai_redis_pass@redis:6379/2}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - sentinelai-network
+
+networks:
+  sentinelai-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  zap_data:
+  scan_workspace:
+  reports_data:

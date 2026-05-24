@@ -1,0 +1,235 @@
+#!/usr/bin/env groovy
+// ============================================
+// SentinelAI - Jenkins Pipeline Template
+// ============================================
+// Add this Jenkinsfile to your repository root.
+// This pipeline triggers SentinelAI security scans on builds.
+//
+// Required Jenkins credentials:
+//   sentinelai-api-key    - Your SentinelAI organization API key
+//
+// Optional environment variables:
+//   SENTINELAI_BASE_URL   - Your SentinelAI instance URL (default: http://localhost:8000)
+//   SENTINELAI_FAIL_ON    - Minimum severity to fail build (default: high)
+//   SENTINELAI_MODULES    - Comma-separated list of modules (default: sast,secrets,dependencies,ai_review)
+
+pipeline {
+    agent any
+    
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds()
+    }
+    
+    environment {
+        SENTINELAI_BASE_URL = "${env.SENTINELAI_BASE_URL ?: 'http://localhost:8000'}"
+        SENTINELAI_FAIL_ON = "${env.SENTINELAI_FAIL_ON ?: 'high'}"
+        SENTINELAI_MODULES = "${env.SENTINELAI_MODULES ?: 'sast,secrets,dependencies,ai_review'}"
+        SCAN_DEPTH = "${env.BRANCH_NAME == 'main' || env.BRANCH_NAME == 'master' ? 'standard' : 'quick'}"
+    }
+    
+    stages {
+        // --- Stage 1: Start Security Scan ---
+        stage('Start SentinelAI Scan') {
+            steps {
+                script {
+                    echo "Starting SentinelAI security scan..."
+                    echo "Repository: ${env.GIT_URL}"
+                    echo "Branch: ${env.BRANCH_NAME}"
+                    echo "Commit: ${env.GIT_COMMIT}"
+                    echo "Modules: ${env.SENTINELAI_MODULES}"
+                    
+                    // Start scan via SentinelAI API
+                    def apiKey = credentials('sentinelai-api-key')
+                    
+                    def modulesList = env.SENTINELAI_MODULES.split(',').collect { "\"${it.trim()}\"" }.join(',')
+                    
+                    def response = httpRequest(
+                        url: "${env.SENTINELAI_BASE_URL}/api/scans/github",
+                        httpMode: 'POST',
+                        contentType: 'APPLICATION_JSON',
+                        customHeaders: [[name: 'Authorization', value: "Bearer ${apiKey}"]],
+                        requestBody: """
+                        {
+                            \"repo_url\": \"${env.GIT_URL}\",
+                            \"branch\": \"${env.BRANCH_NAME}\",
+                            \"modules\": [${modulesList}]
+                        }
+                        """,
+                        validResponseCodes: '202',
+                        consoleLogResponseBody: true
+                    )
+                    
+                    def json = readJSON text: response.content
+                    env.SCAN_ID = json.scan_id
+                    echo "Scan started: ${env.SCAN_ID}"
+                }
+            }
+        }
+        
+        // --- Stage 2: Wait for Scan Completion ---
+        stage('Wait for Scan Results') {
+            steps {
+                script {
+                    def apiKey = credentials('sentinelai-api-key')
+                    def maxWait = 1800  // 30 minutes
+                    def waited = 0
+                    def status = "running"
+                    
+                    while (waited < maxWait && status in ["pending", "queued", "running", "completing"]) {
+                        sleep(15)
+                        waited += 15
+                        
+                        def response = httpRequest(
+                            url: "${env.SENTINELAI_BASE_URL}/api/scans/${env.SCAN_ID}",
+                            httpMode: 'GET',
+                            customHeaders: [[name: 'Authorization', value: "Bearer ${apiKey}"]],
+                            validResponseCodes: '200',
+                            consoleLogResponseBody: false
+                        )
+                        
+                        def json = readJSON text: response.content
+                        status = json.status
+                        echo "Scan status: ${status} (${waited}s elapsed)"
+                        
+                        if (status == "complete") {
+                            env.SCAN_GRADE = json.grade
+                            env.SCAN_RISK_SCORE = json.risk_score.toString()
+                            
+                            // Get findings count at threshold
+                            def findingsResponse = httpRequest(
+                                url: "${env.SENTINELAI_BASE_URL}/api/scans/${env.SCAN_ID}/findings?severity=${env.SENTINELAI_FAIL_ON}",
+                                httpMode: 'GET',
+                                customHeaders: [[name: 'Authorization', value: "Bearer ${apiKey}"]],
+                                validResponseCodes: '200',
+                                consoleLogResponseBody: false
+                            )
+                            
+                            def findingsJson = readJSON text: findingsResponse.content
+                            env.SCAN_FINDINGS_COUNT = findingsJson.total.toString()
+                            
+                            echo "Scan complete: Grade=${env.SCAN_GRADE}, Risk=${env.SCAN_RISK_SCORE}, Findings=${env.SCAN_FINDINGS_COUNT}"
+                        }
+                    }
+                    
+                    if (status != "complete") {
+                        error("Scan failed or timed out. Final status: ${status}")
+                    }
+                }
+            }
+        }
+        
+        // --- Stage 3: Download Reports ---
+        stage('Download Reports') {
+            steps {
+                script {
+                    def apiKey = credentials('sentinelai-api-key')
+                    
+                    // Download JSON report
+                    httpRequest(
+                        url: "${env.SENTINELAI_BASE_URL}/api/scans/${env.SCAN_ID}/report/json",
+                        httpMode: 'GET',
+                        customHeaders: [[name: 'Authorization', value: "Bearer ${apiKey}"]],
+                        validResponseCodes: '200',
+                        outputFile: 'sentinelai-report.json'
+                    )
+                    
+                    // Download HTML report
+                    httpRequest(
+                        url: "${env.SENTINELAI_BASE_URL}/api/scans/${env.SCAN_ID}/report/html",
+                        httpMode: 'GET',
+                        customHeaders: [[name: 'Authorization', value: "Bearer ${apiKey}"]],
+                        validResponseCodes: '200',
+                        outputFile: 'sentinelai-report.html'
+                    )
+                    
+                    echo "Reports downloaded successfully"
+                }
+            }
+        }
+        
+        // --- Stage 4: Publish Reports ---
+        stage('Publish Reports') {
+            steps {
+                // Archive the reports
+                archiveArtifacts artifacts: 'sentinelai-report.*', allowEmptyArchive: false
+                
+                // Publish HTML report
+                publishHTML(target: [
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: '.',
+                    reportFiles: 'sentinelai-report.html',
+                    reportName: 'SentinelAI Security Report'
+                ])
+            }
+        }
+        
+        // --- Stage 5: Quality Gate (Fail Check) ---
+        stage('Security Quality Gate') {
+            when {
+                expression {
+                    // Only fail if fail-on is set to critical and findings exist
+                    return env.SENTINELAI_FAIL_ON == 'critical'
+                }
+            }
+            steps {
+                script {
+                    def findingsCount = env.SCAN_FINDINGS_COUNT.toInteger()
+                    
+                    if (findingsCount > 0) {
+                        unstable("Found ${findingsCount} critical severity findings. Grade: ${env.SCAN_GRADE}")
+                        
+                        // Add badge
+                        addBadge(
+                            id: 'sentinelai-grade',
+                            icon: env.SCAN_GRADE in ['A', 'B'] ? 'completed.gif' : 'error.gif',
+                            text: "SentinelAI Grade: ${env.SCAN_GRADE}"
+                        )
+                    } else {
+                        echo "No critical findings detected"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                // Display summary
+                if (env.SCAN_GRADE) {
+                    echo "========================================"
+                    echo "  SentinelAI Scan Summary"
+                    echo "========================================"
+                    echo "  Scan ID:      ${env.SCAN_ID}"
+                    echo "  Grade:        ${env.SCAN_GRADE}"
+                    echo "  Risk Score:   ${env.SCAN_RISK_SCORE}/100"
+                    echo "  Findings:     ${env.SCAN_FINDINGS_COUNT ?: 'N/A'}"
+                    echo "========================================"
+                }
+            }
+            
+            // Clean workspace
+            cleanWs(
+                deleteDirs: true,
+                notFailBuild: true,
+                patterns: [[pattern: 'sentinelai-report.*', type: 'EXCLUDE']]
+            )
+        }
+        
+        success {
+            echo "SentinelAI scan completed successfully"
+        }
+        
+        unstable {
+            echo "SentinelAI scan found security issues"
+        }
+        
+        failure {
+            echo "SentinelAI scan failed or timed out"
+        }
+    }
+}
