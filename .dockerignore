@@ -1,0 +1,50 @@
+# ============================================
+# SentinelAI — .dockerignore (repo root)
+# ============================================
+
+# Git
+.git
+.gitignore
+
+# Python caches
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Virtual environments
+.venv
+venv
+env
+
+# Local env files — never bake credentials into images
+.env
+*.env
+!.env.example
+
+# Local logs and scan artifacts
+backend/logs/
+backend/reports/
+backend/scan_workspace/
+/tmp/
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# CI templates (not needed in the image)
+ci-templates/
+
+# README / docs (not needed in the image)
+README.md
+index.html
+start.sh
+docker-compose*.yml
