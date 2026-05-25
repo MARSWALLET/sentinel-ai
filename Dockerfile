@@ -38,18 +38,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     weasyprint libcairo2 libpango-1.0-0 libpangocairo-1.0-0 \
     # jq for JSON parsing
     jq \
-    # Go for Go-based tools
-    golang-go \
     # Ruby for Ruby tools
     ruby ruby-dev \
     # Node.js for JS tools
     nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
+# Install modern Go (Go 1.23.2) manually as Debian's package is too old
+RUN wget -q https://go.dev/dl/go1.23.2.linux-amd64.tar.gz -O /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+
 # ── Go-based security tools ────────────────────────────────────────────────
 ENV GOPATH=/go
 ENV PATH=$GOPATH/bin:/usr/local/go/bin:$PATH
 RUN mkdir -p $GOPATH
+
 
 RUN go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
 RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest

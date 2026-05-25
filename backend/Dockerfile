@@ -31,8 +31,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     default-jre-headless \
     # jq for JSON parsing
     jq \
-    # Go for Go-based tools
-    golang-go \
     # Ruby for Ruby tools
     ruby ruby-dev \
     # Node.js for JS tools
@@ -42,10 +40,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Cleanup
     && rm -rf /var/lib/apt/lists/*
 
+# Install modern Go (Go 1.23.2) manually as Debian's package is too old
+RUN wget -q https://go.dev/dl/go1.23.2.linux-amd64.tar.gz -O /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+
 # Install Go-based security tools
 ENV GOPATH=/go
 ENV PATH=$GOPATH/bin:/usr/local/go/bin:$PATH
 RUN mkdir -p $GOPATH
+
 
 # Install httpx
 RUN go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
