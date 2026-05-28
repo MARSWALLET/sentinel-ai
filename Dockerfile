@@ -79,7 +79,7 @@ RUN curl -sSL https://github.com/zricethezav/gitleaks/releases/download/v8.18.2/
 
 # Trivy
 RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-    | sh -s -- -b /usr/local/bin v0.48.0
+    | sh -s -- -b /usr/local/bin v0.70.0
 
 # Grype
 RUN curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
